@@ -23,6 +23,7 @@ import json
 import math
 import random
 import argparse
+import shutil
 from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
@@ -532,7 +533,8 @@ class MemoryEfficientTrainer(Trainer):
         if segments is not None:
             # global_step counts optimizer updates (not accumulation microsteps).
             weight = cosine_cot_weight(
-                self.state.global_step, self.state.max_steps,
+                self.state.global_step - self.schedule_start_step,
+                self.schedule_end_step - self.schedule_start_step,
                 self.cot_weight_start, self.cot_weight_end,
             )
             loss = segment_normalized_loss(logits, labels, segments, weight, self.answer_weight)
@@ -743,6 +745,8 @@ def main():
     parser.add_argument("--cot_weight_start", type=float, default=1.0)
     parser.add_argument("--cot_weight_end", type=float, default=0.5)
     parser.add_argument("--answer_weight", type=float, default=1.0)
+    parser.add_argument("--schedule_start_epoch", type=float, default=None,
+                        help="Extension run: start the new CoT schedule at this cumulative epoch.")
     parser.add_argument("--stop_after_epoch", type=int, default=None,
                         help="Pause at this cumulative epoch; keep --epochs fixed for resume")
     parser.add_argument("--crop_bbox", action="store_true", default=True)
@@ -765,6 +769,9 @@ def main():
         args.epoch_end_mode = True
         if min(args.cot_weight_start, args.cot_weight_end) < 0 or args.answer_weight <= 0:
             parser.error("CoT weights must be nonnegative and answer_weight positive")
+        if args.schedule_start_epoch is not None:
+            if args.schedule_start_epoch <= 1 or args.schedule_start_epoch >= args.epochs:
+                parser.error("schedule_start_epoch must be > 1 and < epochs")
     if args.logging_steps < 1 or (args.eval_steps is not None and args.eval_steps < 1):
         raise ValueError("logging_steps/eval_steps must be positive")
 
@@ -892,6 +899,8 @@ def main():
     trainer.cot_weight_start = args.cot_weight_start
     trainer.cot_weight_end = args.cot_weight_end
     trainer.answer_weight = args.answer_weight
+    trainer.schedule_start_step = 0
+    trainer.schedule_end_step = 1
 
     # 4. Tự động Resume từ checkpoint gần nhất (Local hoặc tự tải từ HuggingFace Hub trên máy ảo mới)
     last_ckpt = None
@@ -957,15 +966,38 @@ def main():
             "answer_weight": args.answer_weight, "lr": args.lr,
             "model_id": args.model_id, "max_seq_length": args.max_seq_length,
             "lora_r": args.lora_r, "lora_alpha": args.lora_alpha,
+            "schedule_start_epoch": args.schedule_start_epoch,
         }
         class ScheduleStateCallback(TrainerCallback):
             def on_train_begin(self, arguments, state, control, **kwargs):
                 config = dict(schedule_config, total_steps=state.max_steps)
                 if last_ckpt:
                     path = Path(last_ckpt) / "scheduled_cot_config.json"
-                    if not path.is_file() or json.loads(path.read_text(encoding="utf-8")) != config:
-                        raise ValueError("Scheduled CoT resume config mismatch or missing metadata. Keep epochs/batch/weights/LR unchanged; use a separate output directory for a new run.")
+                    if not path.is_file():
+                        raise ValueError("Scheduled CoT resume metadata is missing from the checkpoint.")
+                    old = json.loads(path.read_text(encoding="utf-8"))
+                    if args.schedule_start_epoch is None:
+                        # Checkpoints created before extension support did not
+                        # contain this optional field; treat it as None.
+                        old.setdefault("schedule_start_epoch", None)
+                        if old != config:
+                            raise ValueError("Scheduled CoT resume config mismatch. Keep epochs/batch/weights/LR unchanged, or use --schedule_start_epoch for a planned extension.")
+                    else:
+                        invariant = ["mode", "batch_size", "grad_accum", "world_size",
+                                     "train_samples", "lr", "model_id", "max_seq_length",
+                                     "lora_r", "lora_alpha", "answer_weight"]
+                        if any(old.get(k) != config.get(k) for k in invariant):
+                            raise ValueError("Extension resume changed an invariant training setting.")
+                        if old.get("epochs") != args.schedule_start_epoch - 1:
+                            raise ValueError("schedule_start_epoch must be the epoch immediately after the existing run.")
+                        if abs(float(old.get("cot_weight_end", -999)) - float(args.cot_weight_start)) > 1e-8:
+                            raise ValueError("The extension start CoT weight must equal the previous run's ending weight.")
                 self.config = config
+                trainer.schedule_start_step = (
+                    int(round(state.max_steps * (args.schedule_start_epoch - 1) / args.epochs))
+                    if args.schedule_start_epoch is not None else 0
+                )
+                trainer.schedule_end_step = int(state.max_steps)
                 print(f"--> Scheduled CoT: {config}")
 
             def on_save(self, arguments, state, control, **kwargs):
@@ -975,7 +1007,11 @@ def main():
 
             def on_log(self, arguments, state, control, logs=None, **kwargs):
                 if logs is not None:
-                    logs["cot_weight"] = cosine_cot_weight(state.global_step, state.max_steps, args.cot_weight_start, args.cot_weight_end)
+                    logs["cot_weight"] = cosine_cot_weight(
+                        state.global_step - trainer.schedule_start_step,
+                        trainer.schedule_end_step - trainer.schedule_start_step,
+                        args.cot_weight_start, args.cot_weight_end,
+                    )
                     logs["answer_weight"] = args.answer_weight
 
         # Save metadata before HubPushCallback uploads the checkpoint.
@@ -992,6 +1028,12 @@ def main():
         trainer.model.save_pretrained(final_adapter_dir)
         processor.save_pretrained(final_adapter_dir)
         print(f"\n✅ Đã hoàn tất huấn luyện SFT! Trọng số LoRA Adapter được lưu tại: {final_adapter_dir}")
+        epoch_adapter_dir = None
+        if args.stop_after_epoch is not None:
+            epoch_name = f"epoch-{args.stop_after_epoch}"
+            epoch_adapter_dir = os.path.join(args.output_dir, epoch_name)
+            shutil.copytree(final_adapter_dir, epoch_adapter_dir, dirs_exist_ok=True)
+            print(f"--> Immutable epoch adapter saved locally: {epoch_adapter_dir}")
         if hub_callback is not None:
             final_step_dir = os.path.join(args.output_dir, f"checkpoint-{trainer.state.global_step}")
             if os.path.isdir(final_step_dir):
@@ -1001,6 +1043,12 @@ def main():
                     f"Upload final full checkpoint-{trainer.state.global_step} for resume",
                 )
             hub_callback._push(final_adapter_dir, "final_adapter", "Upload final_adapter after training")
+            if epoch_adapter_dir is not None:
+                hub_callback._push(
+                    epoch_adapter_dir, epoch_name,
+                    f"Upload immutable Sea adapter for epoch {args.stop_after_epoch}",
+                )
+                print(f"--> Immutable epoch adapter uploaded: {epoch_name}")
             hub_callback._push_tensorboard_runs(args.output_dir, f"final-step-{trainer.state.global_step}")
 
 
